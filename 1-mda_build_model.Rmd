@@ -1,0 +1,702 @@
+---
+title: "GBM Long Term Survivor Prediction"
+author: "James Long"
+date: "12/16/2019"
+always_allow_html: yes
+output:
+  html_document:
+    theme: united
+    toc: yes
+    toc_collapsed: yes
+    toc_float: yes
+---
+
+## Load Libraries and Data
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r read_data,echo=TRUE,warning=FALSE,message=FALSE}
+#setwd("/Users/jplong/Desktop/fjord/2019-12-ferguson-lts/analysis")
+options(scipen=10)
+library(ggplot2)
+library(kableExtra)
+library(MASS)
+library(survival)
+library(ggfortify)
+library(openxlsx)
+library(pROC)
+library(gridExtra)
+```
+
+```{r merge-mda-files,echo=TRUE}
+dat_cens <- read.xlsx("../data/AliveDeadLong.xlsx")
+dat_cens <- dat_cens[,c(1,4)]
+dat <- read.xlsx("../data/Data set for LONG.NO PHI.xlsx")
+dat <- merge(dat,dat_cens)
+colnames(dat) <- make.names(colnames(dat))
+```
+
+
+
+## Data Cleaning and Exploration
+
+### Removing Variables, Renaming Columns
+
+```{r cleaning}
+## removing De Novo GBM because missing for all STS,MTS
+dat$De.Novo.GBM <- NULL
+## remove meth details
+dat$METH.details <- NULL
+## remove contrast enhancement
+dat$Contrast.enhancement <- NULL
+## replace erroneous T1.T2 ratio > 1 with missing
+dat[(dat$T1.T2.ratio > 1) & !is.na(dat$T1.T2.ratio),"T1.T2.ratio"] <- NA
+## correct spelling of clinical trial
+colnames(dat)[which(colnames(dat)=="Clincal.Trial")] <- "Clinical.Trial"
+## remove deidentifier column
+dat$De.identifier <- NULL
+```
+
+### Recoding Unknown, unknown as NA
+
+```{r na-recode,echo=TRUE}
+dat$MGMT.Meth[dat$MGMT.Meth=="unknown"] <- NA
+dat$MGMT.Meth[dat$MGMT.Meth=="Unknown"] <- NA
+dat$Clinical.Trial[dat$Clinical.Trial=="Unknown"] <- NA
+```
+
+### Imaging Features Missing Codes
+
+Recode 888, 999, and negative values as missing for some of the imaging features.
+
+```{r imaging-features-recode}
+dat$T1.enhancing.vol[dat$T1.enhancing.vol %in% c(888,999)] <- NA
+hist(dat$T1.enhancing.vol)
+
+dat$T2.vol..includes.T1.[dat$T2.vol..includes.T1. %in% c(888,999)] <- NA
+hist(dat$T2.vol..includes.T1.)
+
+dat$Volumeric.EOR..enhancing.disease.[dat$Volumeric.EOR..enhancing.disease. %in% c(888,999)] <- NA
+hist(dat$Volumeric.EOR..enhancing.disease.)
+
+dat$Volumeric.EOR..T2.FLAIR.disease.[dat$Volumeric.EOR..T2.FLAIR.disease. %in% c(888,999)] <- NA
+dat$Volumeric.EOR..T2.FLAIR.disease.[dat$Volumeric.EOR..T2.FLAIR.disease. < 0] <- NA
+hist(dat$Volumeric.EOR..T2.FLAIR.disease.)
+```
+
+### Variables with Some Missing Data
+
+The following variables are missing for some patients.
+
+```{r missingness,echo=TRUE}
+vtype <- vapply(dat,class,"h")
+miss <- vapply(dat,function(x){sum(is.na(x))},c(0))
+vtype <- vtype[miss>0]
+miss <- miss[miss>0]
+vtype <- vtype[order(miss,decreasing=TRUE)]
+miss <- miss[order(miss,decreasing=TRUE)]
+out <- data.frame(miss,vtype)
+colnames(out) <- c("# Patients Missing","Variable Type")
+kable(out,row.names=TRUE) %>%
+  kable_styling(bootstrap_options="striped",
+                full_width = F)
+```
+
+### Recoding Genomic Variables
+
+Genomic variables are coded to **1=unfavorable** and **0=neutral** using the following rules:
+```{r genomic-recode,echo=TRUE}
+genomic_code <- c("Benign"=0,
+                  "variantnotdetected"=0,
+                  "Pathogenic"=1,
+                  "Variant of Unknown Significance"=0,
+                  "variantdetected"=0,
+                  "Presumed Pathogenic"=1)
+
+MOLEC_NAMES <- c("APC","BRAF","CDKN2A",
+                 "EGFR","FBXW7","FGFR3",
+                 "IDH1","KRAS","MUTYH",
+                 "NF1","PIK3CA","PTEN",
+                 "PTPN11","SUFU","TP53")
+
+for(ii in MOLEC_NAMES){
+  print(ii)
+  dat[,ii] <- as.factor(genomic_code[dat[,ii]])
+}
+
+## TODO: extend MOLEC_NAMES to include PDL.1? MGMT?, could ask amy
+
+kable(data.frame(genomic_code),row.names=TRUE) %>%
+  kable_styling(bootstrap_options="striped",
+                full_width = F)
+```
+
+###  Convert Characters to Factors
+
+```{r char-to-fact}
+dat$Survivor <- factor(dat$Survivor,
+                       levels=c("STS","MTS","LTS"))
+dat$EOR..enhancing.disease. <- factor(dat$EOR..enhancing.disease.,
+                                      levels=c("GTR","STR","Biopsy"))
+
+for(ii in 1:ncol(dat)){
+  if(class(dat[,ii])=="character"){
+    dat[,ii] <- as.factor(dat[,ii])
+  }
+}
+
+
+
+```
+
+### Status at Last Follow Up and Survival 
+
+There is 1 MTS who was alive at last follow-up, so this person could actually be a LTS. There are 2 MTS and 4 STS with unknown status at last follow up. These individuals could also be miscategorized (4 STS could actually be MTS or LTS). For now we ignore this issue and proceed as if these 7 individuals are in the correct category.
+
+```{r censoring,echo=TRUE}
+table(dat$Survivor,dat$Status)
+```
+
+
+```{r censoring_prop,echo=TRUE}
+table(dat$Survivor)/nrow(dat)
+table(dat$Survivor)
+```
+
+    
+### STS, MTS, LTS Survival Ranges
+
+```{r summary-stats,echo=TRUE}
+x <- aggregate(dat$OS..years.,by=list(dat$Survivor),FUN=range,simplify=FALSE)
+colnames(x) <- c("Group","Survival Time Range")
+print(x)
+```
+
+### Univariate Plots and Tables
+
+Make histograms / tables for every feature. Look for outliers, unusual values.
+
+```{r univariate-all-plots-tables,echo=TRUE}
+for(ii in 1:ncol(dat)){
+  if(class(dat[,ii])=="numeric"){
+    print(paste0("below summary is for:",colnames(dat)[ii]))
+    print(summary(dat[,ii]))
+    hist(dat[,ii],main=colnames(dat)[ii],xlab=colnames(dat)[ii])
+  } else {
+    print(paste0("below table is for:",colnames(dat)[ii]))
+    print(table(dat[,ii],useNA="always"))
+  }
+}
+```
+
+```{r other-summary-stats,echo=TRUE}
+mean(dat$Necrosis.Vol > 0,na.rm=TRUE)
+sum(dat$Necrosis.Vol > 0,na.rm=TRUE)
+
+sum(dat$Volumeric.EOR..enhancing.disease.==100,na.rm=TRUE)
+mean(dat$Volumeric.EOR..enhancing.disease.==100,na.rm=TRUE)
+
+ix <- dat$Survivor=="LTS"
+sum(ix)
+sum(!is.na(dat$T1.enhancing.vol[ix]))
+temp <- dat$Volumeric.EOR..enhancing.disease.[!is.na(dat$Volumeric.EOR..enhancing.disease.) & ix]
+summary(temp)
+sum(temp==100)
+
+
+ix <- dat$Survivor=="STS"
+sum(ix)
+sum(!is.na(dat$T1.enhancing.vol[ix]))
+temp <- dat$Volumeric.EOR..enhancing.disease.[!is.na(dat$Volumeric.EOR..enhancing.disease.) & ix]
+summary(temp)
+sum(temp==100)
+sum(temp>97)
+
+```
+
+### Multivariate Correlations
+
+```{r clinical-trial-other,echo=FALSE}
+p <- ggplot(subset(dat,!is.na(Clinical.Trial)),
+            aes(x=Clinical.Trial,y=KPS)) +
+      geom_dotplot(binaxis='y', stackdir='center') +
+      stat_summary(fun.y=median, geom="point", shape=18,
+                   size=3, color="red")
+plot(p)
+t.test(KPS~Clinical.Trial,data=dat)
+
+a <- table("IDH"=dat$IDH1,"Clinical.Trial"=dat$Clinical.Trial)
+a
+fisher.test(a)
+```
+
+```{r idh-assoc,echo=FALSE}
+a <- table("IDH"=dat$IDH1,"PTEN"=dat$PTEN)
+a
+fisher.test(a)
+
+p <- ggplot(dat,aes(x=IDH1,y=TML..per.Mb.)) +
+      geom_dotplot(binaxis='y', stackdir='center') +
+      stat_summary(fun.y=median, geom="point", shape=18,
+                   size=3, color="red")
+plot(p)
+t.test(TML..per.Mb.~IDH1,data=dat)
+```
+
+## Univariate Analysis
+
+Each feature is correlated with survival (STS, MTS, LTS) and then ranked based on significance of correlation. Binary features with counts less than 3 in one class are assigned a p--value of 1.
+
+
+```{r data_exploration,echo=FALSE,warning=FALSE}
+not_feat <- c("Survivor","OS..years.","Status")
+dat_feat <- dat[,!(colnames(dat) %in% not_feat)]
+y <- dat$Survivor
+
+N <- 3*ncol(dat_feat)
+res <- data.frame("Feature"=rep(NA_character_,N),
+                  "FeatureType"=rep(NA_character_,N),
+                  "Parameter"=rep(NA_real_,N),
+                  "ParameterName"=rep(NA_real_,N),
+                  "p.value"=rep(NA_real_,N),
+                  "CILow"=rep(NA_real_,N),
+                  "CIHigh"=rep(NA_real_,N),
+                  "FactLevels"=rep(NA_character_,N),
+                  "FactCounts"=rep(NA_integer_,N),
+                  stringsAsFactors=FALSE)
+jj <- 1
+for(ii in 1:ncol(dat_feat)){
+  ix <- !is.na(dat_feat[,ii])
+  fit0 <- polr(y[ix]~1,Hess=TRUE)
+  fit1 <- polr(y[ix]~dat_feat[ix,ii],Hess=TRUE)
+  ## compute wald
+  temp <- summary(fit1)$coefficients
+  d <- nrow(temp)
+  coeff_sd <- temp[1:(d-2),2]
+  coeff <- fit1$coefficients
+  cihigh <- exp(coeff + 2*coeff_sd)
+  cilow <- exp(coeff - 2*coeff_sd)
+  ## compute lrt test
+  res[jj,"p.value"] <- anova(fit1,fit0)$`Pr(Chi)`[2]
+  if(class(dat_feat[,ii])=="factor"){
+    fnames <- names(table(dat_feat[,ii]))
+    res[jj:(jj+length(fnames)-1),"FactLevels"] <- fnames
+    res[jj:(jj+length(fnames)-1),"FactCounts"] <- table(dat_feat[,ii])
+    res[jj,"Feature"] <- colnames(dat_feat)[ii]
+    res[jj,"FeatureType"] <- class(dat_feat[,ii])
+    jj <- jj + 1
+  }
+  res[jj:(jj+d-3),"Feature"] <- rep(colnames(dat_feat)[ii],d-2)
+  res[jj:(jj+d-3),"FeatureType"] <- rep(class(dat_feat[,ii]),d-2)
+  res[jj:(jj+d-3),"Parameter"] <- exp(coeff)
+  res[jj:(jj+d-3),"ParameterName"] <- gsub("dat_feat[ix, ii]","",
+                             names(fit1$coefficients),fixed=TRUE)
+  res[jj:(jj+d-3),"CILow"] <- cilow
+  res[jj:(jj+d-3),"CIHigh"] <- cihigh
+  
+  
+  if(class(dat_feat[,ii])=="factor"){
+    if(min(table(dat_feat[,ii])) < 2){
+      res[jj-1,"p.value"] <- NA
+      res[jj:(jj+d-3),"Parameter"] <- NA
+      res[jj:(jj+d-3),"CILow"] <- NA
+      res[jj:(jj+d-3),"CIHigh"] <- NA
+    }
+  }
+  jj <- jj + (d-2)
+}
+res <- res[rowSums(is.na(res)) < ncol(res),]
+##res <- res[order(res$p.value),]
+```
+
+```{r print_pvalues,echo=FALSE}
+options(knitr.kable.NA = '')
+out <- res
+out[,"p.value"] <- round(out$p.value,4)
+out[out$p.value < 0.0001 & !is.na(out$p.value),"p.value"] <- "< 0.0001"
+##kable(out,row.names=FALSE) %>%
+##  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+```{r print_molec,echo=FALSE}
+out_sub <- out[out$Feature %in% MOLEC_NAMES,]
+out_sub$Feature[duplicated(out_sub$Feature)] <- NA
+ci <- paste0("[",round(out_sub$CILow,2),",",round(out_sub$CIHigh,2),"]")
+ci[ci=="[NA,NA]"] <- NA
+out_sub[,"95% CI"] <- ci
+out_sub2 <- out_sub[,c("Feature","FactLevels","FactCounts","Parameter","95% CI","p.value")]
+colnames(out_sub2) <- c("Feature","Level","Count","Odds Ratio (OR)","OR 95% CI","p-value")
+kable(out_sub2,row.names=FALSE,linesep = "") %>%
+  kable_styling(full_width = F) %>%
+  kable_styling("bordered") %>%
+  kable_styling(bootstrap_options = "condensed")
+```
+
+```{r print_clinical,echo=FALSE}
+out_sub <- out[!(out$Feature %in% MOLEC_NAMES),]
+out_sub$Feature[duplicated(out_sub$Feature)] <- NA
+ci <- paste0("[",round(out_sub$CILow,2),",",round(out_sub$CIHigh,2),"]")
+ci[ci=="[NA,NA]"] <- NA
+out_sub[,"95% CI"] <- ci
+out_sub2 <- out_sub[,c("Feature","FactLevels","FactCounts","Parameter","95% CI","p.value")]
+colnames(out_sub2) <- c("Feature","Level","Count","Odds Ratio (OR)","OR 95% CI","p-value")
+kable(out_sub2,row.names=FALSE) %>%
+  kable_styling(full_width = F) %>%
+  kable_styling("bordered") %>%
+  kable_styling(bootstrap_options = "condensed")
+```
+
+
+### Feature versus Survival Plots
+
+We consider all features with p-value less than 0.1 to be potentially interesting and make plots/tables for them.
+
+```{r feature_plots,echo=FALSE,warning=FALSE,fig.align="center",fig.width=6,fig.height=4,message=FALSE}
+ix <- res$p.value<0.1 & !is.na(res$p.value)
+feat_names <- res[ix,"Feature"]
+ps <- res[ix,"p.value"]
+featsy <- data.frame(y,dat_feat,check.names=FALSE)
+
+## make plots and tables
+for(ii in 1:length(feat_names)){
+  cl <- class(featsy[,feat_names[ii]])
+  if(cl=="numeric"){
+    p <- ggplot(featsy,aes_string(x="y",y=feat_names[ii])) +
+      geom_dotplot(binaxis='y', stackdir='center') +
+      stat_summary(fun.y=median, geom="point", shape=18,
+                   size=3, color="red") +
+      xlab(paste0("p-value: ",round(ps[ii],7)))
+    plot(p)
+  } else{
+    ## TODO: some kind of plot / figure for categorical variables
+    print(feat_names[ii])
+    print(table(featsy$y,featsy[,feat_names[ii]]))
+  }
+}
+```
+
+
+
+```{r kps_and_trial,echo=FALSE,warning=FALSE,fig.align="center",fig.width=6,fig.height=4,eval=TRUE,message=FALSE}
+p <- ggplot(dat,aes(x=Clinical.Trial,y=KPS)) +
+      geom_dotplot(binaxis='y', stackdir='center') +
+      stat_summary(fun.y=median, geom="point", shape=18,
+                   size=3, color="red")
+
+plot(p)
+```
+
+
+
+## Multivariate Model Building
+
+### Clinical Trial Participation
+
+* Clinical trial participation happens after diagnosis.
+* Cannot use trial participation to make prediction at time of diagnosis.
+* Trial participation is associated with better survival because,
+    * Trial drugs increase survival, and/or
+    * Those surviving longer have more opportunity to participate in trials.
+    
+  
+### TML
+
+Tumor mutational load (TML) does not have a standard definition and may be computed differently across different assays. This would bias the results of a predictive model which is constructed using data from one assay and then used to predict patient responses whose TML was measured with a different assay. In order to address this issue, we remove TML prior to building the predictive model.
+
+### Feature Imputation
+
+Select features which pass p-value screening. Character / factor variables are imputed with category ``Unknown``. Numeric / continuous variables are imputed with the median.
+
+```{r make-feat-cand}
+## select features which pass p-value screening
+ix <- res$p.value<0.1 & !is.na(res$p.value)
+feat_cand <- res[ix,"Feature"]
+feat_cand <- feat_cand[feat_cand!="Clinical.Trial"]
+feat_cand <- feat_cand[feat_cand!="TML..per.Mb."]
+feat_cand <- unique(feat_cand)
+## impute values so no missingness
+
+### Imputation
+for(ii in 1:ncol(featsy)){
+  if(class(featsy[,ii])=="numeric"){
+    featsy[is.na(featsy[,ii]),ii] <- median(featsy[,ii],
+                                            na.rm=TRUE)
+  }
+  if(class(featsy[,ii])=="factor" & names(featsy)[ii]!="y"){
+    temp <- as.character(featsy[,ii])
+    temp[is.na(temp)] <- "Unknown"
+    featsy[,ii] <- as.factor(temp)
+  }
+}
+```
+
+### Forward Stepwise Selection Based on AIC
+
+We build a model to predict STS, MTS, LTS using **forward stepwise selection.** Basic idea:
+
+* Starting with p features, build p single feature models.
+* Choose the best fitting single feature model. Suppose this model uses feature X.
+* Build models with features X + Y where Y is any remaining feature.
+* Choose the best fitting two variable model.
+* Repeat until we have used all variables.
+* Choose final model which has minimum AIC.
+
+
+```{r ordinal-proportional-odds,echo=FALSE,warning=FALSE}
+## find best model using AIC and forward selection
+feat_model <- character()
+p <- length(feat_cand)
+fitaic <- rep(NA_real_,p)
+fits <- vector("list",p)
+for(ii in 1:p){
+  fitaic_cand <- rep(NA_real_,length(feat_cand))
+  fits_cand <- vector("list",length(fitaic_cand))
+  for(jj in 1:length(fitaic_cand)){
+    featsy_sub <- featsy[c("y",feat_model,feat_cand[jj])]
+    fits_cand[[jj]] <- polr(y~.,data=featsy_sub,Hess=TRUE)
+    fitaic_cand[jj] <- extractAIC(fits_cand[[jj]])[2]
+  }
+  ix <- which.min(fitaic_cand)
+  feat_model <- c(feat_model,feat_cand[ix])
+  feat_cand <- feat_cand[-ix]
+  fits[[ii]] <- fits_cand[[ix]]
+  fitaic[ii] <- fitaic_cand[ix]
+}
+## below code is built-in forward selection in MASS
+## gives same results as we get above
+## serves as check on our code
+##frm <- as.formula(paste0("~",paste0(feat_cand,collapse="+")))
+##fit0 <- polr(y~1,data=featsy)
+##fit_aic_check <- stepAIC(fit0,scope=list(lower=~1,upper=frm),
+##                         direction="both",trace=1,
+##                         keep=function(x,y){return(list(fit=x,AIC=y))})
+```
+
+```{r plot-stepwise,echo=FALSE}
+par(mar=c(10,5,.5,.5))
+plot(1:length(fitaic),fitaic,axes=FALSE,xlab="",ylab="AIC")
+points(1:length(fitaic),fitaic,type='l')
+axis(2)
+axis(1,1:length(feat_model),feat_model,las=2)
+abline(v=which.min(fitaic),col='red')
+```
+
+```{r where-cut,echo=TRUE}
+fit <- fits[[which.min(fitaic)]]
+```
+
+## Internal Model Validation
+
+We select the model with smallest AIC and show internal validation.
+
+* **Calibration**: The model makes predictions such as, ``This patient has 80% chance of being a LTS.'' Are these probabilities roughly in line with the data?
+* **Accuracy**: How well is the model able to separate classes?
+
+
+### Calibration
+
+```{r calibration,echo=FALSE}
+class_probs <- predict(fit,type="prob")
+lts_prob <- class_probs[,3]
+true_class <- fit$model$y
+
+## LTS
+df <- data.frame(cl=true_class,lts_prob=lts_prob)
+p <- ggplot(df, aes(x=lts_prob, fill=cl)) +
+  geom_density(alpha=0.4) +
+  labs(x="LTS Model Probability",y="Density") +
+  labs(fill="") +
+  theme(legend.position = c(0.8, 0.8))
+```
+
+```{r plots-out-valid1,fig.align="center",fig.height=4,fig.width=5}
+plot(p)
+```
+
+
+### Accuracy
+
+We determine the concordance index for the data:
+
+```{r c-index}
+class_probs <- predict(fit,type="probs")
+preds <- class_probs[,3]
+y_cont <- rep(NA_real_,length(y))
+y_cont[y=="STS"] <- 1
+y_cont[y=="MTS"] <- 2
+y_cont[y=="LTS"] <- 3
+y_cont <- y_cont
+dobs <- rep(1,nrow(dat))
+dobs[dat$Status=="Unknown"] <- 0
+
+cfit <- concordancefit(Surv(y_cont,dobs),preds,timewt="I")
+cfit
+1-pnorm((cfit$concordance - 0.5)/sqrt(cfit$var))
+```
+
+The C-index is `r round(cfit$concordance,3)`.
+
+```{r roc-curve,fig.align="center",fig.height=4,fig.width=4.5,eval=FALSE,echo=FALSE}
+#We plot sensitivity-specificity curves defining STS as one group and MTS and LTS as a second group. The specificity is the fraction of STS correctly determined to be STS. The sensitivity is the fraction of MTS/LTS correctly determined to be MTS/LTS.
+MakeTwoClass <- function(class_probs,control,case){
+  probs_control <- rowSums(class_probs[,control,drop=FALSE])
+  probs_case <- rowSums(class_probs[,case,drop=FALSE])
+  out <- cbind(probs_control,probs_case)
+  colnames(out) <- c(paste0(control,collapse="_"),
+                     paste0(case,collapse="_"))
+  return(out)
+}
+MakeTwoClassHard <- function(cls,control,case){
+  out <- rep(NA_character_,length(cls))
+  out[cls %in% control] <- 0
+  out[cls %in% case] <- 1
+  return(out)
+}
+control <- c("STS","MTS")
+case <- c("LTS")
+
+## for best model
+class_probs2 <- MakeTwoClass(class_probs,control,case)
+class_hard <- MakeTwoClassHard(fit$model$y,control,case)
+a <- roc(class_hard,class_probs2[,2],direction="<")
+plot(a,xlim=c(1,0),print.auc=TRUE,
+     xlab=paste0("Specificity (",paste0(control,collapse=" "),")"),
+     ylab=paste0("Sensitivity (",paste0(case,collapse=" "),")"))
+
+# ## for clinical model
+# class_probs2_clinic <- MakeTwoClass(class_probs_clinic,control,case)
+# class_hard_clinic <- MakeTwoClassHard(fit_clinic$model$y,control,case)
+# a <- roc(class_hard_clinic,class_probs2_clinic[,2],direction="<")
+# plot(a,xlim=c(1,0),print.auc=TRUE,
+#      xlab=paste0("Specificity (",paste0(control,collapse=" "),")"),
+#      ylab=paste0("Sensitivity (",paste0(case,collapse=" "),")"))
+```
+
+
+## Update Prevalences to TCGA
+
+### Load and Visualize TCGA
+
+```{r tcga,echo=TRUE}
+load("0-clean_tcga.RData")
+
+fit_km <- survfit(Surv(tcga$ti,tcga$ti_obs)~1)
+p <- autoplot(fit_km) +
+  coord_cartesian(xlim=c(0,7)) +
+  labs(x="Time (years)",y="Survival")
+
+a <- summary(fit_km)
+probs <- approx(x=a$time,y=a$surv,xout=c(1,5))
+probs_tcga <- c(1-probs$y[1],probs$y[1] - probs$y[2],probs$y[2])
+```
+
+The TCGA GBM data (after a small amount of screening) set has `r nrow(tcga)` patients. The survival rates are:
+
+* STS (0 - 1 year): `r round(1-probs$y[1],2)`
+* MTS (1 year - 5 years): `r round(probs$y[1]-probs$y[2],2)`
+* LTS (5 year +): `r round(probs$y[2],2)`
+
+The KM Survival curve is
+
+```{r tcga-km,echo=TRUE,fig.align="center",fig.width=6,fig.height=4,message=FALSE}
+plot(p)
+```
+
+
+### Update Prevalences
+
+Converts linear predictors to class probabilities.
+```{r lp-function,echo=TRUE}
+LPtoProbs <- function(lp,zeta){
+  sts <- 1-plogis(lp-zeta[1])
+  lts <- plogis(lp-zeta[2])
+  mts <- 1-sts-lts
+  return(cbind(sts,mts,lts))
+}
+```
+
+The class probabilities returned by `LPtoProbs` closely match 
+```{r test-lp-function,echo=TRUE}
+##test that LPtoProbs is working
+hist(fit$lp)
+class_probs <- LPtoProbs(fit$lp,fit$zeta)
+sum(abs(predict(fit,type="prob")-class_probs))
+```
+
+Generate a matrix of class probabilities at the value of linear predictors in `lp_seq`:
+
+```{r mda-class-predictions,echo=TRUE}
+lp_seq <- seq(from=min(fit$lp),to=max(fit$lp),length.out=100)
+class_probs_mda <- LPtoProbs(lp_seq,fit$zeta)
+probs_md <- rev(as.numeric(table(dat$Survivor)))/nrow(dat)
+```
+
+The prevalences of STS,MTS,LTS in MD Anderson and TCGA differ. LTS patients were deliberately over sampled / enriched in the MD Anderson data (i.e. case/control sampling for 3 classes).  We update the the feature conditional class probabilities (probability of class given features) returned by the `fit` model to match the TCGA class prevalences. Formally this works as follows.
+
+Let $\pi_m$ and $\pi_t$ be the known class prevalences for MD Anderson and TCGA respectively. Let $f(x|c)$ be the probability of observing features $x$ given class $c$, where class is $STS$, $MTS$, or $LTS$. Then the model outputs
+\begin{equation*}
+\pi_m(c|x) = \frac{f(x|c)\pi_m(c)}{\sum_c f(x|c)\pi_m(c)}
+\end{equation*}
+We would like to determine
+\begin{equation*}
+\pi_t(c|x) = \frac{f(x|c)\pi_t(c)}{\sum_c f(x|c)\pi_t(c)}
+\end{equation*}
+Our strategy is to use the known $\pi_m(c|x)$ and $\pi_m(c)$ to determine $f(x|c)$ from the first equation. Then $f(x|c)$ is input into the second equation (along with $\pi_t(c)$, which is known) to determine $\pi_t(c|x)$. Note that $f(x|c)$ can only be determine up to a multiplicative constant.
+
+At fixed $x$, we seek the vector $f = f(x|c) = (f(x|STS),f(x|MTS),f(x|LTS))$ which minimizes
+\begin{equation*}
+g(f) = \sum_{c*} \left(\pi_m(c^*|x) - \frac{f(x|c^*)\pi_m(c^*)}{\sum_c f(x|c)\pi_m(c)}\right)^2
+\end{equation*}
+
+We find $f$ at each vector of probabilities in the grid using a Newton-type algorithm:
+```{r update-probs,echo=TRUE,eval=TRUE}
+g <- function(x,pr,po){
+  return(sum((po - pr*x/(sum(pr*x)))^2))
+}
+fdist <- class_probs_mda
+for(ii in 1:nrow(class_probs_mda)){
+  fdist[ii,] <-  nlm(g,rep(1/3,3),probs_md,class_probs_mda[ii,])$estimate
+}
+```
+Now check work by recomputing MD Anderson class probabilities from $f$
+```{r check_prob_update}
+sum(fdist<0)
+class_probs_up <- t(t(fdist)*probs_md)/colSums(t(fdist)*probs_md)
+sum(abs(class_probs_mda-class_probs_up))
+```
+Make TCGA class probability grid:
+```{r make_tcga_prob_grid}
+## turn class probabilities into tcga probs
+class_probs_tcga <- t(t(fdist)*probs_tcga)/colSums(t(fdist)*probs_tcga)
+```
+
+
+## Output
+
+Write output for Shiny Web App:
+```{r output-for-shiny,echo=TRUE,eval=TRUE}
+class_cum_tcga <- class_probs_tcga
+class_cum_tcga[,2] <- class_cum_tcga[,2] + class_cum_tcga[,1]
+class_cum_tcga[,3] <- 1
+coeffs <- fit$coefficients
+save(lp_seq,class_cum_tcga,coeffs,
+     file="1-mda_build_model_shiny.RData")
+```
+
+Write output for TCGA based validation:
+```{r output-for-validate,echo=TRUE,eval=TRUE}
+mda <- featsy
+save(fit,mda,
+     file="1-mda_build_model_valid.RData")
+```
+
+## Session Info
+
+For reproducibility, the following output details the platform on which the above calculations took place. No scientific results are contained in this section.
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,361 @@
+---
+title: "Validate Model"
+author: "James Long"
+date: "3/6/2020"
+always_allow_html: yes
+output:
+  html_document:
+    theme: united
+    toc: yes
+    toc_collapsed: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(kableExtra)
+library(MASS)
+library(pROC)
+library(survival)
+library(ggfortify)
+
+## colorizes text when using html or pdf output
+## just spits out text x for word
+colorize <- function(x, color) {
+  if(color=="todo"){
+    color <- "red"
+    x <- paste0("TODO: ",x)
+  }
+  if (knitr::is_latex_output()) {
+    sprintf("\\textcolor{%s}{%s}", color, x)
+  } else if (knitr::is_html_output()) {
+    sprintf("<span style='color: %s;'>%s</span>", color, 
+      x)
+  } else x
+}
+
+todo <- function(x){
+  paste0("**",colorize(x,"todo"),"**")
+}
+
+```
+
+```{r load-data,echo=FALSE}
+load("0-clean_tcga.RData")
+load("1-mda_build_model_valid.RData")
+
+## make STS, MTS, LTS variable
+y <- rep("STS",nrow(tcga))
+y[tcga$ti > 1 & tcga$ti < 5] <- "MTS"
+y[tcga$ti >= 5] <- "LTS"
+tcga$y <- as.factor(y)
+tcga$y <- factor(tcga$y,levels(tcga$y)[3:1])
+
+## ranked y for validation with tcga
+y_cont <- rep(NA_real_,length(tcga$y))
+y_cont[tcga$y=="STS"] <- 1
+y_cont[tcga$y=="MTS"] <- 2
+y_cont[tcga$y=="LTS"] <- 3
+tcga$y_cont <- y_cont
+```
+
+
+
+## Data Exploration
+
+### Missing Data
+
+There are a total of `r nrow(tcga)` patients in TCGA. The following variables are missing for some patients:
+
+```{r missingness,echo=TRUE}
+vtype <- vapply(tcga,class,"h")
+miss <- vapply(tcga,function(x){sum(is.na(x))},c(0))
+vtype <- vtype[miss>0]
+miss <- miss[miss>0]
+vtype <- vtype[order(miss,decreasing=TRUE)]
+miss <- miss[order(miss,decreasing=TRUE)]
+out <- data.frame(miss,vtype)
+colnames(out) <- c("# Patients Missing","Variable Type")
+kable(out,row.names=TRUE) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+### Status at Last Follow Up
+
+```{r censoring1,echo=TRUE}
+table(tcga$y,"death observed (1=yes)"=tcga$ti_obs)
+```
+
+### MDA / TCGA Feature Comparison
+
+```{r univariate-comps,echo=FALSE,warning=FALSE}
+ix <- colnames(mda)[colnames(mda) %in% colnames(tcga)]
+mda_sub <- mda[,ix]
+tcga_sub <- tcga[,colnames(mda_sub)]
+mda_sub$source <- "mda"
+tcga_sub$source <- "tcga"
+dat_comb <- rbind(mda_sub,tcga_sub)
+
+for(ii in 1:(ncol(dat_comb)-1)){
+  print(colnames(dat_comb)[ii])
+  if(class(dat_comb[,ii])=="factor"){
+    a <- table(dat_comb[,ii],dat_comb$source,useNA="always")
+    a <- t(t(a)/colSums(a))
+    print(a)
+  }
+  if(class(dat_comb[,ii])=="numeric"){
+    p <- ggplot(data=dat_comb,aes_string(x=dat_comb[,ii],fill="source")) +
+      geom_density(alpha=0.3) + labs(x=colnames(dat_comb)[ii])
+    plot(p)
+  }
+}
+```
+
+### TCGA Feature-Survival Correlations
+
+```{r features-and-response,warning=FALSE}
+feat_names <- colnames(fit$model)
+feat_names <- feat_names[feat_names!="y"]
+
+## make plots and tables
+for(ii in 1:length(feat_names)){
+  cl <- class(tcga[,feat_names[ii]])
+  if(cl=="numeric"){
+    p <- ggplot(tcga,aes_string(x="y",y=feat_names[ii])) +
+      geom_dotplot(binaxis='y', stackdir='center',dotsize=0.4) +
+      stat_summary(fun.y=median, geom="point", shape=18,
+                   size=3, color="red")
+    plot(p)
+  } else{
+    ## TODO: some kind of plot / figure for categorical variables
+    print(feat_names[ii])
+    print(table(tcga$y,tcga[,feat_names[ii]]))
+  }
+}
+```
+
+### Survival Curves
+
+```{r surv-curve-idh1}
+a <- survfit(Surv(tcga$ti,tcga$ti_obs)~tcga$IDH1)
+p <- autoplot(a)
+plot(p)
+```
+
+### TCGA Joint Distributions
+
+```{r age-idh1}
+tcga$IDH1 <- as.factor(tcga$IDH1)
+table("Sex"=tcga$Sex,"IDH"=tcga$IDH1)
+p <- ggplot(tcga,aes(x=IDH1,y=Age)) +
+      geom_dotplot(binaxis='y',stackdir="center",dotsize=.3)
+plot(p)
+```
+
+
+
+## Model Validation
+
+### Validation Strategy
+
+There is loss to follow up in `r 100*round(mean(tcga$ti_obs==0),2)` percent of TCGA patients:
+
+```{r censoring,echo=TRUE}
+table(tcga$y,"death observed (1=yes)"=tcga$ti_obs)
+```
+
+**C-index Details**:
+
+We use the C-index to measure performance
+
+* C-index ranges from 0.5 (useless model) to 1 (perfect predictions)
+* Equivalent to Area Under Curve (AUC) if no loss-to-follow up
+* Method
+    * Model predicts probability of LTS for each TCGA patient
+    * Consider all pairs of patients who are "comparable"
+        * **Comparable**: Patient 1 is LTS (observed death), Patient 2 is MTS (observed death)
+        * **Not comparable**: Patient 1 is LTS (observed death), Patient 2 is MTS (lost to follow up)
+        * **Comparable**: Patient 1 is STS (observed death), Patient 2 is MTS (lost to follow up)
+    * The C-index is the proportion of "comparable" pairs for which the probabilistic prediction is **correctly ordered**
+        * **Correctly Ordered**: Patient 1 is LTS with model probability 0.9 (observed death), Patient 2 is MTS with model probability 0.5 (observed death)
+        * **Incorrectly Ordered**: Patient 1 is LTS with model probability 0.4 (observed death), Patient 2 is MTS with model probability 0.5 (observed death)
+
+
+### Imputation
+
+
+```{r impute-missing}
+for(ii in 1:ncol(tcga)){
+  if(class(tcga[,ii])=="numeric"){
+    tcga[is.na(tcga[,ii]),ii] <- median(tcga[,ii],na.rm=TRUE)
+  }
+  if(class(tcga[,ii])=="factor" & colnames(tcga)[ii]!="y"){
+    temp <- as.character(tcga[,ii])
+    temp[is.na(temp)] <- "Unknown"
+    tcga[,ii] <- as.factor(temp)
+  }
+}
+```
+
+```{r predict-model,include=FALSE}
+MakeTwoClass <- function(class_probs,control,case){
+  probs_control <- rowSums(class_probs[,control,drop=FALSE])
+  probs_case <- rowSums(class_probs[,case,drop=FALSE])
+  out <- cbind(probs_control,probs_case)
+  colnames(out) <- c(paste0(control,collapse="_"),
+                     paste0(case,collapse="_"))
+  return(out)
+}
+MakeTwoClassHard <- function(cls,control,case){
+  out <- rep(NA_character_,length(cls))
+  out[cls %in% control] <- 0
+  out[cls %in% case] <- 1
+  return(out)
+}
+control <- c("STS","MTS")
+case <- c("LTS")
+
+
+## for best model
+class_probs <- predict(fit,type="probs",newdata=tcga)
+class_probs2 <- MakeTwoClass(class_probs,control,case)
+class_hard <- MakeTwoClassHard(tcga$y,control,case)
+a <- roc(class_hard,class_probs2[,2],direction="<")
+plot(a,xlim=c(1,0),print.auc=TRUE,
+     xlab=paste0("Specificity (",paste0(control,collapse=" "),")"),
+     ylab=paste0("Sensitivity (",paste0(case,collapse=" "),")"))
+```
+
+
+### Concordance Index for Validation
+
+```{r probability-boxplots,echo=FALSE,eval=FALSE}
+### boxplots of probability score on y-axis and class STS,MTS,LTS on x
+### could break down x into censored and not censored
+res <- tcga$y
+dobs <- tcga$ti_obs
+class_probs <- predict(fit,type="probs",newdata=tcga)
+
+preds <- class_probs[,3]
+dobs <- as.factor(dobs)
+dfplot <- data.frame(res,dobs,preds)
+head(dfplot)
+
+p <- ggplot(dfplot,aes(x=res,y=preds,fill=dobs)) +
+      geom_boxplot(outlier.shape=NA) +
+      geom_dotplot(binaxis='y',dotsize=0.7,stackdir='center', 
+               position=position_dodge(0.8),binwidth=0.005)
+plot(p)
+```
+
+
+
+```{r c-index-testing,echo=FALSE,eval=FALSE}
+n <- 100
+preds <- rnorm(n)
+res <- rbinom(n,size=1,prob=1/(1+exp(-preds)))
+
+concord_counts <- function(preds,res){
+  ords <- order(preds)
+  preds <- preds[ords]
+  res <- res[ords]
+  count <- sum(res) - cumsum(res)
+  return(c(sum(count[res==0]),sum(res==0)*sum(res==1)))
+}
+concord <- function(preds,res){
+  temp <- concord_counts(preds,res)
+  return(temp[1]/temp[2])
+}
+concord(preds,res)
+cfit <- concordancefit(Surv(res,rep(1,length(res))),preds,timewt="I")
+cfit
+roc(res,preds,direction="<")
+plot(preds,res)
+
+## use with several ordered levels
+# res_lev <- unique(res)
+# res_lev <- res_lev[order(res_lev)]
+# nums <- c(0,0)
+# for(ii in 1:(length(res_lev)-1)){
+#   ix <- (res > res_lev[ii]) | (res==res_lev[ii] & dobs==1)
+#   preds_sub <- preds[ix]
+#   res_sub <- res[ix]
+#   res_sub[res_sub==res_lev[ii]] <- 0
+#   res_sub[res_sub>res_lev[ii]] <- 1
+#   temp <- concord_counts(preds_sub,res_sub)
+#   nums <- nums + temp
+# }
+# nums[1]/nums[2]
+```
+
+```{r cindex-compute,echo=FALSE}
+res <- tcga$y_cont
+dobs <- tcga$ti_obs
+class_probs <- predict(fit,type="probs",newdata=tcga)
+preds <- class_probs[,3]
+cfit <- concordancefit(Surv(res,dobs),preds,timewt="I")
+cfit
+
+## p-value
+1-pnorm((cfit$concordance - 0.5)/sqrt(cfit$var))
+```
+
+The concordance is `r round(cfit$concordance,2)`. This is significantly better than random guessing (p < 0.0001).
+
+## Comparison with TCGA Based Nomograms
+
+Compare MD Anderson train / TCGA test to TCGA train / TCGA test. The performances are not that different. By training / testing on TCGA, can obtain C-index $\approx$ 0.7. But not much higher than model trained on MD Anderson cohort.
+
+Model with same variables but retrained coefficients:
+
+```{r comparison-same-vars}
+## the best score for model with these covariates is not much
+## better than what we got
+fit_tcga <- coxph(Surv(ti,ti_obs)~Age+IDH1+KPS+PTEN+TP53,data=tcga)
+fit_tcga_risk <- predict(fit_tcga)
+cfit_tcga <- concordancefit(Surv(res,dobs),-fit_tcga_risk,timewt="I")
+cfit_tcga
+```
+
+Model with different variables:
+
+```{r comparison-diff-vars}
+## the best score for model with these covariates is not much
+## better than what we got
+fit_tcga <- coxph(Surv(ti,ti_obs)~Age+IDH1+KPS+PTEN+TP53+MGMT.Meth+Sex+BRAF+TML..per.Mb.,
+                  data=tcga)
+fit_tcga_risk <- predict(fit_tcga)
+cfit_tcga <- concordancefit(Surv(res,dobs),-fit_tcga_risk,timewt="I")
+cfit_tcga
+```
+
+
+## Comparison with Other Nomograms
+
+Direct comparison with other nomograms on TCGA data is not possible because TCGA lacks features which other nomograms use:
+
+* **Gittleman Neuro-Oncology 2017** ([https://academic.oup.com/neuro-oncology/article/19/5/669/3076814](https://academic.oup.com/neuro-oncology/article/19/5/669/3076814)): Proposes a nomogram which uses several features including extent of resection. Extent of resection is not available for TCGA so we cannot compare to our model.
+```{r cox-model,echo=FALSE}
+## coefficients from Table 2 of article
+coeffs <- c(1.030,1.319,0.723,0.547,0.453,1.184,1.68,0,493)
+```
+* **Liu AJNR 2016** ([https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4833648/](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4833648/)): Uses extent of resection. States was available for only 24/131 TCGA patients ("gross total resection (GTR), available for 24 cases in the TCGA test cohort.")
+* **Lancet Oncol. 2007** ([https://www.sciencedirect.com/science/article/pii/S1470204507703844](https://www.sciencedirect.com/science/article/pii/S1470204507703844])): Nomograms use EOR and/or mini-mental state evaluation (MMSE) which are not available for TCGA (see Figures 1,3, and 5 in paper).
+
+## Determine Quantiles for Nomogram App
+
+```{r lp-tcga-quants}
+model_feats <- colnames(fit$model)[2:ncol(fit$model)]
+frm <- formula(paste0("~",paste0(model_feats,collapse="+")))
+tcga_mat <- model.matrix(frm,data=tcga)
+tcga_mat <- tcga_mat[,2:ncol(tcga_mat)]
+head(tcga_mat)
+lp_tcga <- colSums(t(tcga_mat)*coef(fit))
+quants_thres <- c(0.01,0.05,0.1,0.2,0.5,0.8,0.9,0.95,0.99)
+lp_tcga_quants <- quantile(lp_tcga,quants_thres)
+quants_thres
+lp_tcga_quants
+save(lp_tcga_quants,quants_thres,
+     file="2-validate_model_lp_quants.RData")
+```
