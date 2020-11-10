@@ -10,7 +10,7 @@ This repository contains data cleaning, model construction, and validation code 
 
 This code was developed for and described in:
 
-**[Ferguson et al. Neuro-Oncology Advances. A validated integrated clinical and molecular glioblastoma long-term survival-predictive nomogram](https://academic.oup.com/noa/advance-article/doi/10.1093/noajnl/vdaa146/5944711)**
+**[Ferguson, Sherise D., et al. "A validated integrated clinical and molecular glioblastoma long-term survival-predictive nomogram." Neuro-Oncology Advances (2020).](https://academic.oup.com/noa/advance-article/doi/10.1093/noajnl/vdaa146/5944711)**
 
 Please cite that paper if you use this work.
 
